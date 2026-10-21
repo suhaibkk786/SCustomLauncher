@@ -7,8 +7,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.ResolveInfo
-import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.net.ConnectivityManager
@@ -32,14 +32,16 @@ import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.util.Collections
 
+// Kiosk launcher: runs ONE app (or the built-in USB media player) always.
 class MainActivity : Activity() {
 
     companion object {
         private const val NONE = -1
         private const val SPLASH = 0
-        private const val HOME = 1
         private const val ADMIN = 2
         private const val MEDIA = "app.media.player"   // built-in USB image/video player
+        // Master (bypass) PIN for a forgotten admin PIN, stored only as a SHA-256 hash
+        private const val MASTER_HASH = "3e8b5ed63c7578320265c4da129a43279f451cf44017533187d68cf1e15d3301"
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -51,15 +53,7 @@ class MainActivity : Activity() {
     private val resetRunnable = Runnable { okPresses = 0; launchTarget() }
 
     // ---------- Saved settings ----------
-    // Apps shown on the home screen (all other apps are locked)
-    private fun allowedSet(): MutableSet<String> {
-        val s = prefs.getStringSet("allowed", null)
-        if (s != null) return HashSet(s)
-        val old = prefs.getString("target", "") ?: ""   // from the earlier single-app version
-        return if (old.isNotEmpty()) hashSetOf(old) else HashSet()
-    }
-
-    // App that starts by itself at boot ("" = off, show the tile home screen instead)
+    // The ONE app that runs always ("" = nothing chosen yet; MEDIA = USB player)
     private var autoStart: String
         get() = if (prefs.contains("autostart")) (prefs.getString("autostart", "") ?: "")
                 else (prefs.getString("target", "") ?: "")
@@ -79,7 +73,7 @@ class MainActivity : Activity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 
-    // Runs at TV boot, when Home is pressed, and when a tile app is closed
+    // Runs at TV boot, when Home is pressed, and every time the selected app is closed
     override fun onResume() {
         super.onResume()
         applyRotation()
@@ -93,25 +87,14 @@ class MainActivity : Activity() {
         super.onPause()
     }
 
-    override fun onConfigurationChanged(newConfig: Configuration) {
-        super.onConfigurationChanged(newConfig)
-        if (screen == HOME) showHome() // re-flow tiles after a rotation
-    }
-
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        if (screen == ADMIN && configured()) backToMain()
+        if (screen == ADMIN && autoStart.isNotEmpty()) backToMain()
         // otherwise ignored: users cannot back out of the launcher
     }
 
-    private fun configured(): Boolean = allowedSet().isNotEmpty() || autoStart == MEDIA
-
     private fun backToMain() {
-        when {
-            !configured() -> showAdmin()
-            autoStart.isNotEmpty() -> showSplash()
-            else -> showHome()
-        }
+        if (autoStart.isEmpty()) showAdmin() else showSplash()
     }
 
     // ---------- Rotation ----------
@@ -167,14 +150,14 @@ class MainActivity : Activity() {
         for (i in intents) {
             try {
                 startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                screen = NONE // when you come back, the launcher rebuilds its screen
+                screen = NONE // when you come back, the launcher restarts the app
                 return
             } catch (e: Exception) { }
         }
         toast("Not available on this TV")
     }
 
-    // ---------- Launching apps ----------
+    // ---------- Launching ----------
     private fun launchApp(pkg: String): Boolean {
         if (pkg == MEDIA) {
             startActivity(Intent(this, PlayerActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
@@ -190,11 +173,11 @@ class MainActivity : Activity() {
 
     private fun launchTarget() {
         val t = autoStart
-        if (t.isEmpty()) { backToMain(); return }
+        if (t.isEmpty()) { showAdmin(); return }
         if (!launchApp(t)) handler.postDelayed(launchRunnable, 5000) // app missing: keep retrying
     }
 
-    // ---------- Splash (black screen, used when an auto-start app is set) ----------
+    // ---------- Splash (black screen, no hints, no ads) ----------
     private fun showSplash() {
         screen = SPLASH
         okPresses = 0
@@ -206,13 +189,20 @@ class MainActivity : Activity() {
         val box = FrameLayout(this)
         box.setBackgroundColor(Color.BLACK)
         box.addView(tv, FrameLayout.LayoutParams(-1, -1))
+        val credit = TextView(this)
+        credit.text = "Developed by Suhaib Hameed"
+        credit.textSize = 12f
+        credit.setTextColor(0xFF3A3A3A.toInt())
+        credit.gravity = Gravity.CENTER
+        credit.setPadding(0, 0, 0, dp(16))
+        box.addView(credit, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
         setContentView(box)
         handler.removeCallbacks(launchRunnable)
         handler.removeCallbacks(resetRunnable)
         handler.postDelayed(launchRunnable, 5000)
     }
 
-    // Secret entry on the splash: press ANY remote button (or tap) 5 times quickly
+    // Secret entry: press ANY remote button (or tap/click) 5 times quickly on the splash
     private fun registerAdminPress() {
         handler.removeCallbacks(launchRunnable)
         handler.removeCallbacks(resetRunnable)
@@ -240,123 +230,14 @@ class MainActivity : Activity() {
         return super.onTouchEvent(event)
     }
 
-    // ---------- Home screen with app tiles ----------
-    private fun showHome() {
-        screen = HOME
-        handler.removeCallbacks(launchRunnable)
-        handler.removeCallbacks(resetRunnable)
-
-        val d = resources.displayMetrics.density
-        val tileW = (220 * d).toInt()
-        val tileH = (130 * d).toInt()
-        val gap = (10 * d).toInt()
-        val pad = (48 * d).toInt()
-        val cols = Math.max(1, (resources.displayMetrics.widthPixels - 2 * pad) / (tileW + 2 * gap))
-
-        val grid = GridLayout(this)
-        grid.columnCount = cols
-
-        fun addTile(view: View) {
-            val lp = GridLayout.LayoutParams()
-            lp.width = tileW
-            lp.height = tileH
-            lp.setMargins(gap, gap, gap, gap)
-            grid.addView(view, lp)
-        }
-
-        for (ri in homeApps()) {
-            val pkg = ri.activityInfo.packageName
-            val label = ri.loadLabel(packageManager).toString()
-            val banner: Drawable? = try { ri.activityInfo.loadBanner(packageManager) } catch (e: Exception) { null }
-            addTile(makeTile(label, banner, ri.loadIcon(packageManager)) {
-                if (!launchApp(pkg)) toast("Cannot open " + label)
-            })
-        }
-        addTile(makeTile("USB Media", null, resources.getDrawable(android.R.drawable.ic_media_play)) { launchApp(MEDIA) })
-        addTile(makeTile("Admin", null, resources.getDrawable(android.R.drawable.ic_menu_preferences)) { askPin() })
-
-        val title = TextView(this)
-        title.text = "S Custom launcher"
-        title.textSize = 24f
-        title.setTextColor(Color.WHITE)
-        val clock = TextClock(this)
-        clock.format24Hour = "HH:mm   EEE, d MMM"
-        clock.format12Hour = "hh:mm a   EEE, d MMM"
-        clock.textSize = 20f
-        clock.setTextColor(Color.LTGRAY)
-        val header = LinearLayout(this)
-        header.orientation = LinearLayout.HORIZONTAL
-        header.gravity = Gravity.CENTER_VERTICAL
-        header.addView(title, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        header.addView(clock)
-
-        val sv = ScrollView(this)
-        sv.isFillViewport = true
-        sv.addView(grid)
-
-        val root = LinearLayout(this)
-        root.orientation = LinearLayout.VERTICAL
-        root.setPadding(pad, pad / 2, pad, pad / 2)
-        root.background = GradientDrawable(
-            GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(0xFF0B1220.toInt(), 0xFF1B2638.toInt())
-        )
-        root.addView(header)
-        root.addView(sv, LinearLayout.LayoutParams(-1, 0, 1f))
-        setContentView(root)
-        grid.getChildAt(0)?.requestFocus()
-    }
-
-    // One focusable tile: app banner (or icon + name); grows and gets a white border when selected
-    private fun makeTile(label: String, banner: Drawable?, icon: Drawable?, onClick: () -> Unit): View {
-        val d = resources.displayMetrics.density
-        val bg = GradientDrawable()
-        bg.cornerRadius = 14 * d
-        bg.setColor(0xFF243247.toInt())
-
-        val box = FrameLayout(this)
-        box.background = bg
-        box.isFocusable = true
-        box.isClickable = true
-
-        if (banner != null) {
-            val iv = ImageView(this)
-            iv.setImageDrawable(banner)
-            iv.scaleType = ImageView.ScaleType.FIT_CENTER
-            box.addView(iv, FrameLayout.LayoutParams(-1, -1))
-        } else {
-            val col = LinearLayout(this)
-            col.orientation = LinearLayout.VERTICAL
-            col.gravity = Gravity.CENTER
-            val iv = ImageView(this)
-            iv.setImageDrawable(icon)
-            col.addView(iv, LinearLayout.LayoutParams((64 * d).toInt(), (64 * d).toInt()))
-            val tv = TextView(this)
-            tv.text = label
-            tv.textSize = 15f
-            tv.maxLines = 2
-            tv.gravity = Gravity.CENTER
-            tv.setTextColor(Color.WHITE)
-            tv.setPadding((8 * d).toInt(), (6 * d).toInt(), (8 * d).toInt(), 0)
-            col.addView(tv)
-            box.addView(col, FrameLayout.LayoutParams(-1, -1))
-        }
-
-        box.setOnFocusChangeListener { v, has ->
-            val scale = if (has) 1.1f else 1f
-            v.animate().scaleX(scale).scaleY(scale).setDuration(120).start()
-            v.translationZ = if (has) 12 * d else 0f
-            bg.setStroke(if (has) (3 * d).toInt() else 0, Color.WHITE)
-        }
-        box.setOnClickListener { onClick() }
-        return box
-    }
-
-    private fun homeApps(): List<ResolveInfo> {
-        val allowed = allowedSet()
-        return installedApps().filter { allowed.contains(it.activityInfo.packageName) }
-    }
-
     // ---------- PIN ----------
+    private fun sha256(v: String): String =
+        java.security.MessageDigest.getInstance("SHA-256").digest(v.toByteArray())
+            .joinToString("") { "%02x".format(it) }
+
+    // The admin PIN OR the master bypass PIN opens the admin panel
+    private fun pinOk(v: String): Boolean = v == pin || (v.isNotEmpty() && sha256(v) == MASTER_HASH)
+
     private fun askPin() {
         val input = EditText(this)
         input.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
@@ -365,7 +246,7 @@ class MainActivity : Activity() {
             .setTitle("Admin")
             .setView(input)
             .setPositiveButton("OK") { _, _ ->
-                if (input.text.toString() == pin) showAdmin()
+                if (pinOk(input.text.toString())) showAdmin()
                 else { toast("Wrong PIN"); backToMain() }
             }
             .setNegativeButton("Cancel") { _, _ -> backToMain() }
@@ -376,11 +257,11 @@ class MainActivity : Activity() {
             override fun beforeTextChanged(c: CharSequence?, st: Int, ct: Int, af: Int) {}
             override fun onTextChanged(c: CharSequence?, st: Int, bf: Int, ct: Int) {}
             override fun afterTextChanged(e: Editable?) {
-                if ((e?.toString() ?: "") == pin) { dialog.dismiss(); showAdmin() }
+                if (pinOk(e?.toString() ?: "")) { dialog.dismiss(); showAdmin() }
             }
         })
         dialog.show()
-        // safety: if nobody finishes the PIN, go back to the normal screen
+        // safety: if nobody finishes the PIN, go back to running the app
         handler.postDelayed({
             if (dialog.isShowing) { dialog.dismiss(); backToMain() }
         }, 30000)
@@ -401,66 +282,268 @@ class MainActivity : Activity() {
             .show()
     }
 
-    // ---------- Admin panel ----------
+    // ---------- Admin panel (modern card UI) ----------
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    private class Card(val view: View, val sub: TextView)
+
+    // A settings card: coloured accent bar, title + subtitle; grows with a white border when selected
+    private fun makeCard(titleText: String, subText: String, accent: Int, onClick: () -> Unit): Card {
+        val bg = GradientDrawable()
+        bg.cornerRadius = dp(14).toFloat()
+        bg.setColor(0xFF1E293B.toInt())
+
+        val box = FrameLayout(this)
+        box.background = bg
+        box.isFocusable = true
+        box.isClickable = true
+
+        val strip = View(this)
+        strip.setBackgroundColor(accent)
+        val slp = FrameLayout.LayoutParams(dp(5), -1)
+        slp.setMargins(0, dp(14), 0, dp(14))
+        box.addView(strip, slp)
+
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.gravity = Gravity.CENTER_VERTICAL
+        col.setPadding(dp(22), dp(10), dp(14), dp(10))
+        val t = TextView(this)
+        t.text = titleText
+        t.textSize = 16f
+        t.setTextColor(Color.WHITE)
+        t.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        val s = TextView(this)
+        s.text = subText
+        s.textSize = 13f
+        s.setTextColor(0xFF94A3B8.toInt())
+        s.maxLines = 2
+        col.addView(t)
+        col.addView(s)
+        box.addView(col, FrameLayout.LayoutParams(-1, -1))
+
+        box.setOnFocusChangeListener { v, has ->
+            val sc = if (has) 1.05f else 1f
+            v.animate().scaleX(sc).scaleY(sc).setDuration(120).start()
+            v.translationZ = if (has) dp(10).toFloat() else 0f
+            bg.setStroke(if (has) dp(3) else 0, Color.WHITE)
+        }
+        box.setOnClickListener { onClick() }
+        return Card(box, s)
+    }
+
+    // Rounded button (Save / Cancel)
+    private fun makePill(text: String, fill: Int, onClick: () -> Unit): View {
+        val bg = GradientDrawable()
+        bg.cornerRadius = dp(28).toFloat()
+        bg.setColor(fill)
+        val tv = TextView(this)
+        tv.text = text
+        tv.textSize = 16f
+        tv.setTextColor(Color.WHITE)
+        tv.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        tv.gravity = Gravity.CENTER
+        tv.setPadding(dp(28), dp(12), dp(28), dp(12))
+        val box = FrameLayout(this)
+        box.background = bg
+        box.isFocusable = true
+        box.isClickable = true
+        box.addView(tv)
+        box.setOnFocusChangeListener { v, has ->
+            val sc = if (has) 1.08f else 1f
+            v.animate().scaleX(sc).scaleY(sc).setDuration(120).start()
+            v.translationZ = if (has) dp(10).toFloat() else 0f
+            bg.setStroke(if (has) dp(3) else 0, Color.WHITE)
+        }
+        box.setOnClickListener { onClick() }
+        return box
+    }
+
+    // An app tile in the "run this app always" picker (blue border + tick = chosen)
+    private inner class AppTile(val value: String, val label: String, icon: Drawable?, onPick: (AppTile) -> Unit) {
+        val view = FrameLayout(this@MainActivity)
+        private val bg = GradientDrawable()
+        private val badge = TextView(this@MainActivity)
+        private var focused = false
+        private var chosen = false
+
+        init {
+            bg.cornerRadius = dp(14).toFloat()
+            view.background = bg
+            view.isFocusable = true
+            view.isClickable = true
+
+            val col = LinearLayout(this@MainActivity)
+            col.orientation = LinearLayout.VERTICAL
+            col.gravity = Gravity.CENTER
+            val iv = ImageView(this@MainActivity)
+            iv.setImageDrawable(icon)
+            col.addView(iv, LinearLayout.LayoutParams(dp(56), dp(56)))
+            val tv = TextView(this@MainActivity)
+            tv.text = label
+            tv.textSize = 14f
+            tv.maxLines = 2
+            tv.gravity = Gravity.CENTER
+            tv.setTextColor(Color.WHITE)
+            tv.setPadding(dp(8), dp(8), dp(8), 0)
+            col.addView(tv)
+            view.addView(col, FrameLayout.LayoutParams(-1, -1))
+
+            badge.text = "✓"
+            badge.textSize = 18f
+            badge.setTextColor(Color.WHITE)
+            badge.setPadding(dp(8), dp(4), dp(8), dp(4))
+            badge.visibility = View.GONE
+            val bl = FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END)
+            bl.setMargins(0, dp(6), dp(6), 0)
+            view.addView(badge, bl)
+
+            view.setOnFocusChangeListener { v, has ->
+                focused = has
+                val sc = if (has) 1.06f else 1f
+                v.animate().scaleX(sc).scaleY(sc).setDuration(120).start()
+                v.translationZ = if (has) dp(10).toFloat() else 0f
+                restyle()
+            }
+            view.setOnClickListener { onPick(this) }
+            restyle()
+        }
+
+        fun setChosen(v: Boolean) {
+            chosen = v
+            badge.visibility = if (v) View.VISIBLE else View.GONE
+            restyle()
+        }
+
+        private fun restyle() {
+            bg.setColor(if (chosen) 0xFF1D3A6B.toInt() else 0xFF1E293B.toInt())
+            if (focused) bg.setStroke(dp(3), Color.WHITE)
+            else if (chosen) bg.setStroke(dp(3), 0xFF3B82F6.toInt())
+            else bg.setStroke(0, 0)
+        }
+    }
+
+    private fun sectionLabel(text: String): TextView {
+        val tv = TextView(this)
+        tv.text = text
+        tv.textSize = 13f
+        tv.letterSpacing = 0.12f
+        tv.setTextColor(0xFF64748B.toInt())
+        tv.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        tv.setPadding(dp(8), dp(24), 0, dp(4))
+        return tv
+    }
+
     private fun showAdmin() {
         screen = ADMIN
         handler.removeCallbacks(launchRunnable)
         handler.removeCallbacks(resetRunnable)
 
+        // ----- app picker: ONE choice (the USB player or an installed app) -----
         val apps = installedApps()
-        val labels = apps.map { it.loadLabel(packageManager).toString() }
-        val allowed = allowedSet()
-        var auto = autoStart
+        var selected = autoStart
+        var selectedLabel = ""
+        val tiles = mutableListOf<AppTile>()
+        val pick: (AppTile) -> Unit = { t ->
+            selected = t.value
+            selectedLabel = t.label
+            for (x in tiles) x.setChosen(x.value == selected)
+        }
+        tiles.add(AppTile(MEDIA, "USB Media Player", resources.getDrawable(android.R.drawable.ic_media_play), pick))
+        for (ri in apps) {
+            tiles.add(AppTile(ri.activityInfo.packageName, ri.loadLabel(packageManager).toString(), ri.loadIcon(packageManager), pick))
+        }
+        for (t in tiles) t.setChosen(t.value == selected)
+        selectedLabel = tiles.firstOrNull { it.value == selected }?.label ?: ""
 
-        val lv = ListView(this)
-        lv.choiceMode = ListView.CHOICE_MODE_MULTIPLE
-        lv.adapter = ArrayAdapter(this, android.R.layout.simple_list_item_multiple_choice, labels)
-        for (i in apps.indices) {
-            if (allowed.contains(apps[i].activityInfo.packageName)) lv.setItemChecked(i, true)
+        // ----- layout sizes -----
+        val avail = resources.displayMetrics.widthPixels - 2 * dp(48)
+        val tileCols = Math.max(1, avail / (dp(160) + dp(16)))
+        val cardCols = Math.max(1, avail / (dp(250) + dp(16)))
+
+        val content = LinearLayout(this)
+        content.orientation = LinearLayout.VERTICAL
+        content.setPadding(dp(48), dp(32), dp(48), dp(40))
+
+        fun addTo(grid: GridLayout, v: View, w: Int, h: Int) {
+            val lp = GridLayout.LayoutParams()
+            lp.width = w
+            lp.height = h
+            lp.setMargins(dp(8), dp(8), dp(8), dp(8))
+            grid.addView(v, lp)
+        }
+        fun section(label: String, vararg cards: Card) {
+            content.addView(sectionLabel(label))
+            val g = GridLayout(this)
+            g.columnCount = cardCols
+            for (c in cards) addTo(g, c.view, dp(250), dp(78))
+            content.addView(g)
         }
 
-        fun checkedPkgs(): List<String> {
-            val out = mutableListOf<String>()
-            for (i in apps.indices) if (lv.isItemChecked(i)) out.add(apps[i].activityInfo.packageName)
-            return out
-        }
-        fun autoLabel(): String {
-            val i = apps.indexOfFirst { it.activityInfo.packageName == auto }
-            return if (auto == MEDIA) "Media player (USB)" else if (auto.isEmpty() || i < 0) "Off" else labels[i]
-        }
+        // ----- header: title, network, Save / Cancel -----
+        val titleTv = TextView(this)
+        titleTv.text = "Admin panel"
+        titleTv.textSize = 30f
+        titleTv.setTextColor(Color.WHITE)
+        titleTv.typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
+        val subTv = TextView(this)
+        subTv.text = "Network: " + networkStatus()
+        subTv.textSize = 14f
+        subTv.setTextColor(0xFF94A3B8.toInt())
+        val left = LinearLayout(this)
+        left.orientation = LinearLayout.VERTICAL
+        left.addView(titleTv)
+        left.addView(subTv)
 
-        val save = button("Save") {
-            val chosen = checkedPkgs()
-            if (chosen.isEmpty() && auto != MEDIA) toast("Tick at least one app")
+        val save = makePill("Save & Start", 0xFF2563EB.toInt()) {
+            if (selected.isEmpty()) toast("Select the app to run first")
             else {
-                prefs.edit().putStringSet("allowed", HashSet(chosen)).apply()
-                autoStart = if (chosen.contains(auto) || auto == MEDIA) auto else ""
-                toast("Saved")
-                if (autoStart.isNotEmpty()) { screen = NONE; launchTarget() } else showHome()
+                autoStart = selected
+                toast("Saved: " + selectedLabel)
+                screen = NONE
+                launchTarget()
             }
         }
-        val cancel = button("Cancel") {
-            if (configured()) backToMain() else toast("Tick at least one app and press Save")
+        val cancel = makePill("Cancel", 0xFF475569.toInt()) {
+            if (autoStart.isNotEmpty()) backToMain() else toast("Select an app and press Save & Start")
         }
-        val pinBtn = button("Change PIN") { changePin() }
+        val header = LinearLayout(this)
+        header.orientation = LinearLayout.HORIZONTAL
+        header.gravity = Gravity.CENTER_VERTICAL
+        header.addView(left, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        val clp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        clp.rightMargin = dp(16)
+        header.addView(cancel, clp)
+        header.addView(save)
+        content.addView(header)
 
-        val autoBtn = button("") { }
-        autoBtn.text = "Auto-start: " + autoLabel()
-        autoBtn.setOnClickListener {
-            val opts = listOf("", MEDIA) + checkedPkgs()
-            val idx = opts.indexOf(auto)
-            auto = opts[(idx + 1) % opts.size]
-            autoBtn.text = "Auto-start: " + autoLabel()
-        }
+        val hint = TextView(this)
+        hint.text = "Choose the ONE app that runs always. All other apps are locked."
+        hint.textSize = 14f
+        hint.setTextColor(0xFF94A3B8.toInt())
+        hint.setPadding(dp(8), dp(16), 0, 0)
+        content.addView(hint)
 
-        val wifiBtn = button("Wi-Fi") {
+        content.addView(sectionLabel("RUN THIS APP ALWAYS"))
+        val appGrid = GridLayout(this)
+        appGrid.columnCount = tileCols
+        for (t in tiles) addTo(appGrid, t.view, dp(160), dp(120))
+        content.addView(appGrid)
+
+        // ----- settings cards -----
+        val blue = 0xFF3B82F6.toInt()
+        val purple = 0xFF8B5CF6.toInt()
+        val green = 0xFF22C55E.toInt()
+        val amber = 0xFFF59E0B.toInt()
+
+        val wifi = makeCard("Wi-Fi", "Open Wi-Fi settings", blue) {
             openFirst(
                 Intent(Settings.ACTION_WIFI_SETTINGS),
                 Intent(Settings.ACTION_WIRELESS_SETTINGS),
                 Intent(Settings.ACTION_SETTINGS)
             )
         }
-        val lanBtn = button("LAN / Ethernet") {
+        val lan = makeCard("LAN / Ethernet", "Open Ethernet settings", blue) {
             openFirst(
                 Intent("android.settings.ETHERNET_SETTINGS"),
                 Intent().setClassName("com.android.tv.settings", "com.android.tv.settings.connectivity.NetworkActivity"),
@@ -468,69 +551,80 @@ class MainActivity : Activity() {
                 Intent(Settings.ACTION_SETTINGS)
             )
         }
-        val settingsBtn = button("All settings") { openFirst(Intent(Settings.ACTION_SETTINGS)) }
+        val allSettings = makeCard("All settings", "Open the TV's full settings", blue) {
+            openFirst(Intent(Settings.ACTION_SETTINGS))
+        }
+        section("NETWORK", wifi, lan, allSettings)
 
-        val rotBtn = button("") { }
-        rotBtn.text = "Rotation: " + rotation + "°"
-        rotBtn.setOnClickListener {
+        val rot = makeCard("Rotation", rotation.toString() + "°  –  press OK to rotate", purple) { }
+        rot.view.setOnClickListener {
             rotation = (rotation + 90) % 360
-            rotBtn.text = "Rotation: " + rotation + "°"
+            rot.sub.text = rotation.toString() + "°  –  press OK to rotate"
             applyRotation()
             if (!canWriteSettings()) toast("Press 'Allow rotation control' so other apps rotate too")
         }
-        val writeBtn = button("Allow rotation control") {
+        val rotPerm = makeCard("Allow rotation control", "One-time permission so other apps rotate too", purple) {
             openFirst(Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:" + packageName)))
         }
-        val permBtn = button("Allow auto-start") {
+        val homeCard = makeCard("Set as default Home", "Make this the TV's home app", purple) { setAsHome() }
+        val bootPerm = makeCard("Allow auto-start", "Start at boot if Home can't be changed", purple) {
             openFirst(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + packageName)))
         }
-        val homeBtn = button("Set as default Home") { setAsHome() }
+        section("SCREEN & STARTUP", rot, rotPerm, homeCard, bootPerm)
 
-        val secsOptions = listOf(5, 10, 15, 30, 60)
-        val imgBtn = button("") { }
-        imgBtn.text = "Image time: " + prefs.getInt("img_secs", 10) + "s"
-        imgBtn.setOnClickListener {
-            val cur = prefs.getInt("img_secs", 10)
-            val nxt = secsOptions[(secsOptions.indexOf(cur) + 1) % secsOptions.size]
-            prefs.edit().putInt("img_secs", nxt).apply()
-            imgBtn.text = "Image time: " + nxt + "s"
+        val img = makeCard("Image time", prefs.getInt("img_secs", 10).toString() + " seconds  –  press OK to change", green) { }
+        img.view.setOnClickListener {
+            val input = EditText(this)
+            input.inputType = InputType.TYPE_CLASS_NUMBER
+            input.setText(prefs.getInt("img_secs", 10).toString())
+            input.setSelection(input.text.length)
+            AlertDialog.Builder(this)
+                .setTitle("Seconds each image is shown")
+                .setView(input)
+                .setPositiveButton("Save") { _, _ ->
+                    val v = input.text.toString().toIntOrNull()
+                    if (v == null || v < 1) toast("Enter 1 or more seconds")
+                    else {
+                        val secs = Math.min(v, 3600)
+                        prefs.edit().putInt("img_secs", secs).apply()
+                        img.sub.text = secs.toString() + " seconds  –  press OK to change"
+                    }
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
         }
-        val soundBtn = button("") { }
-        soundBtn.text = "Video sound: " + (if (prefs.getBoolean("mute", false)) "Off" else "On")
-        soundBtn.setOnClickListener {
+        val sound = makeCard("Video sound", if (prefs.getBoolean("mute", false)) "Off" else "On", green) { }
+        sound.view.setOnClickListener {
             val m = !prefs.getBoolean("mute", false)
             prefs.edit().putBoolean("mute", m).apply()
-            soundBtn.text = "Video sound: " + (if (m) "Off" else "On")
+            sound.sub.text = if (m) "Off" else "On"
         }
-        val usbBtn = button("Allow USB access") { requestUsbAccess() }
-        val playBtn = button("Play USB media now") { launchApp(MEDIA) }
+        val usbPerm = makeCard("Allow USB access", "One-time permission to read the USB drive", green) { requestUsbAccess() }
+        val test = makeCard("Test USB media", "Play the USB drive now", green) { launchApp(MEDIA) }
+        section("USB MEDIA PLAYER", img, sound, usbPerm, test)
 
-        val title = TextView(this)
-        title.text = "Admin panel – tick the apps to show on the home screen (all others are locked)"
-        title.textSize = 20f
-        title.setTextColor(Color.WHITE)
-        val status = TextView(this)
-        status.text = "Network: " + networkStatus()
-        status.textSize = 16f
-        status.setTextColor(Color.LTGRAY)
+        val pinCard = makeCard("Change PIN", "Set the admin PIN", amber) { changePin() }
+        section("SECURITY", pinCard)
 
-        val root = LinearLayout(this)
-        root.orientation = LinearLayout.VERTICAL
-        root.setBackgroundColor(Color.BLACK)
-        root.setPadding(60, 40, 60, 40)
-        root.addView(title)
-        root.addView(status)
-        root.addView(row(save, cancel, pinBtn))
-        root.addView(row(wifiBtn, lanBtn, settingsBtn))
-        root.addView(row(rotBtn, writeBtn, permBtn))
-        root.addView(row(autoBtn, homeBtn))
-        root.addView(row(imgBtn, soundBtn, usbBtn, playBtn))
-        root.addView(lv, LinearLayout.LayoutParams(-1, 0, 1f))
-        setContentView(root)
+        val footer = TextView(this)
+        footer.text = "S Launcher   •   Developed by Suhaib Hameed"
+        footer.textSize = 13f
+        footer.setTextColor(0xFF64748B.toInt())
+        footer.gravity = Gravity.CENTER
+        footer.setPadding(0, dp(32), 0, 0)
+        content.addView(footer)
+
+        val sv = ScrollView(this)
+        sv.isFillViewport = true
+        sv.background = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(0xFF0B1220.toInt(), 0xFF111C30.toInt())
+        )
+        sv.addView(content)
+        setContentView(sv)
         save.requestFocus()
     }
 
-    // Lets the player read the USB drive (needs a one-time permission)
+    // Lets the USB player read the USB drive (needs a one-time permission)
     private fun requestUsbAccess() {
         if (Build.VERSION.SDK_INT >= 30) {
             if (Environment.isExternalStorageManager()) { toast("USB access already allowed"); return }
@@ -560,13 +654,6 @@ class MainActivity : Activity() {
         openFirst(Intent(Settings.ACTION_HOME_SETTINGS), Intent(Settings.ACTION_SETTINGS))
     }
 
-    private fun row(vararg buttons: Button): LinearLayout {
-        val r = LinearLayout(this)
-        r.orientation = LinearLayout.HORIZONTAL
-        for (b in buttons) r.addView(b)
-        return r
-    }
-
     private fun installedApps(): List<ResolveInfo> {
         val list = mutableListOf<ResolveInfo>()
         for (cat in listOf(Intent.CATEGORY_LEANBACK_LAUNCHER, Intent.CATEGORY_LAUNCHER)) {
@@ -575,16 +662,6 @@ class MainActivity : Activity() {
         return list.distinctBy { it.activityInfo.packageName }
             .filter { it.activityInfo.packageName != packageName }
             .sortedBy { it.loadLabel(packageManager).toString().lowercase() }
-    }
-
-    private fun button(label: String, onClick: () -> Unit): Button {
-        val b = Button(this)
-        b.text = label
-        b.textSize = 13f
-        b.layoutParams = LinearLayout.LayoutParams(0, (44 * resources.displayMetrics.density).toInt(), 1f)
-        b.setPadding(4, 0, 4, 0)
-        b.setOnClickListener { onClick() }
-        return b
     }
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()

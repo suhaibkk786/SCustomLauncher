@@ -27,7 +27,7 @@
     </queries>
 
     <application
-        android:label="S Custom launcher"
+        android:label="S Launcher"
         android:icon="@drawable/ic_launcher"
         android:banner="@drawable/banner"
         android:requestLegacyExternalStorage="true"

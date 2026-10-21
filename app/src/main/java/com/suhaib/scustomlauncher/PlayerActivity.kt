@@ -90,6 +90,14 @@ class PlayerActivity : Activity() {
         return super.onKeyDown(keyCode, event)
     }
 
+    // Locked mode: when "Media player (USB)" is the auto-start app, Back does nothing.
+    // (Opened from the home-screen tile instead, Back leaves the player.)
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        val locked = prefs.getString("autostart", "") == "app.media.player"
+        if (!locked) super.onBackPressed()
+    }
+
     private fun hideSystemUi() {
         @Suppress("DEPRECATION")
         window.decorView.systemUiVisibility =
@@ -193,10 +201,10 @@ class PlayerActivity : Activity() {
         }
         video.setVideoPath(f.absolutePath)
         video.start()
-        // safety: a video that never starts is skipped after 15 seconds
+        // safety: a video that never starts is skipped after 30 seconds
         handler.postDelayed({
             if (myGen == gen && !video.isPlaying && video.currentPosition == 0) next()
-        }, 15000)
+        }, 30000)
     }
 
     private fun showMessage(text: String) {
