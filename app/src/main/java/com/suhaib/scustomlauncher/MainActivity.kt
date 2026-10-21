@@ -1,12 +1,14 @@
 package com.suhaib.scustomlauncher
 
 import android.app.Activity
+import android.app.ActivityManager
 import android.app.AlertDialog
 import android.app.role.RoleManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.ResolveInfo
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
@@ -48,6 +50,8 @@ class MainActivity : Activity() {
     private val prefs by lazy { getSharedPreferences("launcher", Context.MODE_PRIVATE) }
     private var screen = NONE
     private var okPresses = 0
+    private var pendingSel: String? = null   // app chosen in the admin panel but not saved yet
+    private var refocusRot = false           // keep focus on the Rotation card after the screen turns
 
     private val launchRunnable = Runnable { launchTarget() }
     private val resetRunnable = Runnable { okPresses = 0; launchTarget() }
@@ -70,7 +74,12 @@ class MainActivity : Activity() {
     // ---------- Lifecycle ----------
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        @Suppress("DEPRECATION")
+        window.addFlags(
+            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
+        )
+        try { Refresh.reschedule(this) } catch (e: Exception) { }
     }
 
     // Runs at TV boot, when Home is pressed, and every time the selected app is closed
@@ -78,6 +87,11 @@ class MainActivity : Activity() {
         super.onResume()
         applyRotation()
         if (screen == ADMIN) return
+        val now = System.currentTimeMillis()
+        if (now - prefs.getLong("req_refresh_at", 0L) < 20000L) {  // the Auto refresh timer fired
+            prefs.edit().remove("req_refresh_at").apply()
+            killTarget()
+        }
         backToMain()
     }
 
@@ -87,6 +101,12 @@ class MainActivity : Activity() {
         super.onPause()
     }
 
+    // The screen turned (rotation): rebuild the admin panel so it fits the new width/height
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (screen == ADMIN) showAdmin()
+    }
+
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         if (screen == ADMIN && autoStart.isNotEmpty()) backToMain()
@@ -94,23 +114,31 @@ class MainActivity : Activity() {
     }
 
     private fun backToMain() {
-        if (autoStart.isEmpty()) showAdmin() else showSplash()
+        pendingSel = null
+        if (autoStart.isEmpty()) showAdmin()
+        else showSplash()
     }
 
     // ---------- Rotation ----------
     private fun canWriteSettings(): Boolean =
         Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.System.canWrite(this)
 
-    // Rotates this launcher AND (once permission is granted) every other app
+    // System-wide rotation is used only if the permission is granted AND the "Rotate other apps" switch is On
+    private fun systemRotation(): Boolean = prefs.getBoolean("sysrot", true) && canWriteSettings()
+
+    // Rotates this launcher and the USB player, and (if systemRotation) every other app too
     private fun applyRotation() {
         if (!prefs.contains("rotation")) return
-        requestedOrientation = when (rotation) {
+        val sys = systemRotation()
+        requestedOrientation = if (sys) {
+            ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED // follow the system rotation set below
+        } else when (rotation) {
             90 -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
             180 -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
             270 -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT
             else -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
         }
-        if (canWriteSettings()) {
+        if (sys) {
             try {
                 Settings.System.putInt(contentResolver, Settings.System.ACCELEROMETER_ROTATION, 0)
                 Settings.System.putInt(contentResolver, Settings.System.USER_ROTATION, rotation / 90)
@@ -239,6 +267,8 @@ class MainActivity : Activity() {
     private fun pinOk(v: String): Boolean = v == pin || (v.isNotEmpty() && sha256(v) == MASTER_HASH)
 
     private fun askPin() {
+        handler.removeCallbacks(launchRunnable)
+        handler.removeCallbacks(resetRunnable)
         val input = EditText(this)
         input.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
         input.hint = "Admin PIN"
@@ -423,6 +453,47 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------- Auto refresh (optional) ----------
+    private fun refreshText(): String =
+        if (Refresh.enabled(this)) "On  –  press OK to turn off" else "Off  –  press OK to turn on"
+
+    private fun refreshHoursText(): String =
+        "Every " + Refresh.hours(this) + " hours  –  press OK to change"
+
+    // Stops the chosen app so it starts again fresh. The USB player simply restarts.
+    private fun killTarget() {
+        val t = autoStart
+        if (t.isEmpty() || t == MEDIA) return
+        try {
+            (getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager).killBackgroundProcesses(t)
+        } catch (e: Exception) { }
+    }
+
+    private fun askRefreshHours(card: Card) {
+        val input = EditText(this)
+        input.inputType = InputType.TYPE_CLASS_NUMBER
+        input.setText(Refresh.hours(this).toString())
+        input.setSelection(input.text.length)
+        AlertDialog.Builder(this)
+            .setTitle("Refresh the app every how many hours?")
+            .setView(input)
+            .setPositiveButton("Save") { _, _ ->
+                val v = input.text.toString().toIntOrNull()
+                if (v == null || v < 1) toast("Enter 1 or more hours")
+                else {
+                    Refresh.setHours(this, Math.min(v, 720))
+                    Refresh.reschedule(this)
+                    card.sub.text = refreshHoursText()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun sysText(): String =
+        if (prefs.getBoolean("sysrot", true)) "On  –  the whole TV rotates (needs permission)"
+        else "Off  –  only the launcher and USB player rotate"
+
     private fun sectionLabel(text: String): TextView {
         val tv = TextView(this)
         tv.text = text
@@ -441,12 +512,13 @@ class MainActivity : Activity() {
 
         // ----- app picker: ONE choice (the USB player or an installed app) -----
         val apps = installedApps()
-        var selected = autoStart
+        var selected = pendingSel ?: autoStart
         var selectedLabel = ""
         val tiles = mutableListOf<AppTile>()
         val pick: (AppTile) -> Unit = { t ->
             selected = t.value
             selectedLabel = t.label
+            pendingSel = t.value
             for (x in tiles) x.setChosen(x.value == selected)
         }
         tiles.add(AppTile(MEDIA, "USB Media Player", resources.getDrawable(android.R.drawable.ic_media_play), pick))
@@ -460,6 +532,8 @@ class MainActivity : Activity() {
         val avail = resources.displayMetrics.widthPixels - 2 * dp(48)
         val tileCols = Math.max(1, avail / (dp(160) + dp(16)))
         val cardCols = Math.max(1, avail / (dp(250) + dp(16)))
+        val tileW = avail / tileCols - dp(16)
+        val cardW = avail / cardCols - dp(16)
 
         val content = LinearLayout(this)
         content.orientation = LinearLayout.VERTICAL
@@ -476,7 +550,7 @@ class MainActivity : Activity() {
             content.addView(sectionLabel(label))
             val g = GridLayout(this)
             g.columnCount = cardCols
-            for (c in cards) addTo(g, c.view, dp(250), dp(78))
+            for (c in cards) addTo(g, c.view, cardW, dp(78))
             content.addView(g)
         }
 
@@ -499,6 +573,7 @@ class MainActivity : Activity() {
             if (selected.isEmpty()) toast("Select the app to run first")
             else {
                 autoStart = selected
+                pendingSel = null
                 toast("Saved: " + selectedLabel)
                 screen = NONE
                 launchTarget()
@@ -527,7 +602,7 @@ class MainActivity : Activity() {
         content.addView(sectionLabel("RUN THIS APP ALWAYS"))
         val appGrid = GridLayout(this)
         appGrid.columnCount = tileCols
-        for (t in tiles) addTo(appGrid, t.view, dp(160), dp(120))
+        for (t in tiles) addTo(appGrid, t.view, tileW, dp(120))
         content.addView(appGrid)
 
         // ----- settings cards -----
@@ -559,9 +634,22 @@ class MainActivity : Activity() {
         val rot = makeCard("Rotation", rotation.toString() + "°  –  press OK to rotate", purple) { }
         rot.view.setOnClickListener {
             rotation = (rotation + 90) % 360
+            refocusRot = true
+            handler.postDelayed({ refocusRot = false }, 2000)
             rot.sub.text = rotation.toString() + "°  –  press OK to rotate"
             applyRotation()
             if (!canWriteSettings()) toast("Press 'Allow rotation control' so other apps rotate too")
+        }
+        val sysCard = makeCard("Rotate other apps", sysText(), purple) { }
+        sysCard.view.setOnClickListener {
+            val on = !prefs.getBoolean("sysrot", true)
+            prefs.edit().putBoolean("sysrot", on).apply()
+            if (!on && canWriteSettings()) {
+                // switched off: give the other apps their normal orientation back
+                try { Settings.System.putInt(contentResolver, Settings.System.USER_ROTATION, 0) } catch (e: Exception) { }
+            }
+            sysCard.sub.text = sysText()
+            applyRotation()
         }
         val rotPerm = makeCard("Allow rotation control", "One-time permission so other apps rotate too", purple) {
             openFirst(Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:" + packageName)))
@@ -570,7 +658,7 @@ class MainActivity : Activity() {
         val bootPerm = makeCard("Allow auto-start", "Start at boot if Home can't be changed", purple) {
             openFirst(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + packageName)))
         }
-        section("SCREEN & STARTUP", rot, rotPerm, homeCard, bootPerm)
+        section("SCREEN & STARTUP", rot, sysCard, rotPerm, homeCard, bootPerm)
 
         val img = makeCard("Image time", prefs.getInt("img_secs", 10).toString() + " seconds  –  press OK to change", green) { }
         img.view.setOnClickListener {
@@ -603,6 +691,26 @@ class MainActivity : Activity() {
         val test = makeCard("Test USB media", "Play the USB drive now", green) { launchApp(MEDIA) }
         section("USB MEDIA PLAYER", img, sound, usbPerm, test)
 
+        val cyan = 0xFF06B6D4.toInt()
+        val refOn = makeCard("Auto refresh", refreshText(), cyan) { }
+        refOn.view.setOnClickListener {
+            Refresh.setEnabled(this, !Refresh.enabled(this))
+            Refresh.reschedule(this)
+            refOn.sub.text = refreshText()
+            if (Refresh.enabled(this) && Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) {
+                toast("Press 'Allow auto-start' so the refresh can run in the background")
+            }
+        }
+        val refHours = makeCard("Refresh every", refreshHoursText(), cyan) { }
+        refHours.view.setOnClickListener { askRefreshHours(refHours) }
+        section("REFRESH APP", refOn, refHours)
+        val refHint = TextView(this)
+        refHint.text = "When On, the chosen app is stopped and started again fresh after the hours you set (the USB player restarts). Off by default. Needs the \"Allow auto-start\" permission above."
+        refHint.textSize = 13f
+        refHint.setTextColor(0xFF64748B.toInt())
+        refHint.setPadding(dp(8), dp(8), dp(8), 0)
+        content.addView(refHint)
+
         val pinCard = makeCard("Change PIN", "Set the admin PIN", amber) { changePin() }
         section("SECURITY", pinCard)
 
@@ -621,7 +729,7 @@ class MainActivity : Activity() {
         )
         sv.addView(content)
         setContentView(sv)
-        save.requestFocus()
+        if (refocusRot) { refocusRot = false; rot.view.requestFocus() } else save.requestFocus()
     }
 
     // Lets the USB player read the USB drive (needs a one-time permission)

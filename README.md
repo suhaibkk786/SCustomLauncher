@@ -46,3 +46,18 @@ Admin buttons open the TV's network screens. "Rotation" cycles 0/90/180/270; pre
 ## Forgotten PIN
 A built-in master (bypass) PIN also opens the admin panel if the admin PIN is forgotten.
 Ask the developer, Suhaib Hameed, for it. It is not written in this file.
+
+## Rotation notes
+- "Rotate other apps" (admin, SCREEN & STARTUP): On = the whole TV rotates (needs "Allow rotation control").
+  Off = only the launcher and the USB player rotate; other apps keep their own orientation
+  (use this if a rotated app does not fit the screen).
+- The USB player is rebuilt every time the screen turns, and video is drawn on a TextureView so it
+  does not go black after rotation.
+
+## Auto refresh (optional)
+Admin panel > REFRESH APP:
+- "Auto refresh": switch On or Off (Off by default).
+- "Refresh every": number of hours. When On, the chosen app is stopped and started again fresh after
+  that many hours (the USB player restarts).
+- Needs "Allow auto-start" (admin > SCREEN & STARTUP) so the timer can bring the launcher to the front,
+  and the TV clock should be on automatic time.

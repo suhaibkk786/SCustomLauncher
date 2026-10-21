@@ -15,6 +15,11 @@
     <uses-permission android:name="android.permission.WRITE_SETTINGS"
         tools:ignore="ProtectedPermissions" />
 
+    <!-- Auto refresh: alarm for the refresh time, and stopping the app so it starts fresh -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+
     <!-- Read images/videos from the USB drive -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
@@ -61,8 +66,14 @@
             android:name=".PlayerActivity"
             android:exported="false"
             android:launchMode="singleTask"
-            android:stateNotNeeded="true"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation" />
+            android:stateNotNeeded="true" />
+
+        <receiver android:name=".RefreshReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.TIME_SET" />
+                <action android:name="android.intent.action.TIMEZONE_CHANGED" />
+            </intent-filter>
+        </receiver>
 
         <receiver android:name=".BootReceiver" android:exported="true">
             <intent-filter>

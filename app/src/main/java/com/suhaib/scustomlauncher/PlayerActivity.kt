@@ -7,29 +7,46 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.SurfaceTexture
+import android.media.MediaPlayer
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.Surface
+import android.view.TextureView
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.TextView
-import android.widget.VideoView
 import java.io.File
 
-// Plays the images and videos of the USB drive in an endless loop (menu boards / ads)
+// Plays the images and videos of the USB drive in an endless loop (menu boards / ads).
+// Video is drawn on a TextureView so it rotates and resizes correctly with the screen.
 class PlayerActivity : Activity() {
 
     private val handler = Handler(Looper.getMainLooper())
     private val prefs by lazy { getSharedPreferences("launcher", Context.MODE_PRIVATE) }
-    private lateinit var video: VideoView
+
+    private lateinit var root: FrameLayout
+    private lateinit var tex: TextureView
     private lateinit var image: ImageView
     private lateinit var msg: TextView
+
+    private var player: MediaPlayer? = null
+    private var surface: Surface? = null
+    private var pendingFile: File? = null
+    private var pendingGen = 0
+    private var vidW = 0
+    private var vidH = 0
+    private var lastPw = 0
+    private var lastPh = 0
+
     private var list: List<File> = emptyList()
     private var index = 0
     private var gen = 0
@@ -38,19 +55,54 @@ class PlayerActivity : Activity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        val root = FrameLayout(this)
+        root = FrameLayout(this)
         root.setBackgroundColor(Color.BLACK)
-        video = VideoView(this)
-        root.addView(video, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+
+        tex = TextureView(this)
+        tex.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
+                surface = Surface(st)
+                val f = pendingFile
+                if (f != null && pendingGen == gen) {
+                    pendingFile = null
+                    startMedia(f, pendingGen)
+                }
+            }
+            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
+            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                releasePlayer()
+                try { surface?.release() } catch (e: Exception) { }
+                surface = null
+                return true
+            }
+            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+        }
+        root.addView(tex, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+
+        // images and messages are drawn on an opaque black layer above the video
         image = ImageView(this)
         image.scaleType = ImageView.ScaleType.FIT_CENTER
+        image.setBackgroundColor(Color.BLACK)
         image.visibility = View.GONE
         root.addView(image, FrameLayout.LayoutParams(-1, -1))
+
         msg = TextView(this)
+        msg.setBackgroundColor(Color.BLACK)
         msg.setTextColor(Color.LTGRAY)
         msg.textSize = 22f
         msg.gravity = Gravity.CENTER
         root.addView(msg, FrameLayout.LayoutParams(-1, -1))
+
+        // re-fit the video whenever the screen size changes (rotation)
+        root.addOnLayoutChangeListener { _, l, t, r, b, _, _, _, _ ->
+            val w = r - l
+            val h = b - t
+            if (w != lastPw || h != lastPh) {
+                lastPw = w
+                lastPh = h
+                fitVideo()
+            }
+        }
         setContentView(root)
 
         hideSystemUi()
@@ -74,7 +126,8 @@ class PlayerActivity : Activity() {
     override fun onPause() {
         gen++
         handler.removeCallbacksAndMessages(null)
-        try { video.stopPlayback() } catch (e: Exception) { }
+        pendingFile = null
+        releasePlayer()
         super.onPause()
     }
 
@@ -83,15 +136,15 @@ class PlayerActivity : Activity() {
         if (hasFocus) hideSystemUi()
     }
 
-    // Right arrow = next, left arrow = previous, Back = leave the player
+    // Right arrow = next, left arrow = previous
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) { next(); return true }
         if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT) { prev(); return true }
         return super.onKeyDown(keyCode, event)
     }
 
-    // Locked mode: when "Media player (USB)" is the auto-start app, Back does nothing.
-    // (Opened from the home-screen tile instead, Back leaves the player.)
+    // Locked mode: when "USB media player" is the chosen app, Back does nothing.
+    // (Opened by "Test USB media" instead, Back leaves the player.)
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         val locked = prefs.getString("autostart", "") == "app.media.player"
@@ -106,9 +159,14 @@ class PlayerActivity : Activity() {
             View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
     }
 
+    // Same rule as the launcher: system rotation (if allowed and switched on) decides, otherwise lock this screen
     private fun applyOrientation() {
         if (!prefs.contains("rotation")) return
-        requestedOrientation = when (prefs.getInt("rotation", 0)) {
+        val canWrite = Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.System.canWrite(this)
+        val sys = prefs.getBoolean("sysrot", true) && canWrite
+        requestedOrientation = if (sys) {
+            ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        } else when (prefs.getInt("rotation", 0)) {
             90 -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
             180 -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
             270 -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT
@@ -160,7 +218,7 @@ class PlayerActivity : Activity() {
         handler.removeCallbacksAndMessages(null)
         val myGen = ++gen
         val f = list[index]
-        if (!f.exists()) { next(); return }
+        if (!f.exists()) { handler.postDelayed({ if (myGen == gen) next() }, 300); return }
         if (MediaLib.isVideo(f)) playVideo(f, myGen) else showImage(f, myGen)
     }
 
@@ -172,8 +230,8 @@ class PlayerActivity : Activity() {
                     if (bmp == null) {
                         next()
                     } else {
-                        try { video.stopPlayback() } catch (e: Exception) { }
-                        video.visibility = View.GONE
+                        releasePlayer()
+                        pendingFile = null
                         msg.visibility = View.GONE
                         image.setImageBitmap(bmp)
                         image.visibility = View.VISIBLE
@@ -190,26 +248,70 @@ class PlayerActivity : Activity() {
     private fun playVideo(f: File, myGen: Int) {
         image.visibility = View.GONE
         msg.visibility = View.GONE
-        video.visibility = View.VISIBLE
-        video.setOnPreparedListener { mp ->
-            if (prefs.getBoolean("mute", false)) mp.setVolume(0f, 0f)
+        if (surface == null) {
+            pendingFile = f       // starts as soon as the video surface is ready
+            pendingGen = myGen
+        } else {
+            startMedia(f, myGen)
         }
-        video.setOnCompletionListener { if (myGen == gen) next() }
-        video.setOnErrorListener { _, _, _ ->
-            if (myGen == gen) next()
-            true
-        }
-        video.setVideoPath(f.absolutePath)
-        video.start()
         // safety: a video that never starts is skipped after 30 seconds
         handler.postDelayed({
-            if (myGen == gen && !video.isPlaying && video.currentPosition == 0) next()
+            if (myGen == gen && !isVideoPlaying()) next()
         }, 30000)
     }
 
+    private fun startMedia(f: File, myGen: Int) {
+        releasePlayer()
+        vidW = 0
+        vidH = 0
+        val p = MediaPlayer()
+        player = p
+        try {
+            p.setSurface(surface)
+            p.setDataSource(f.absolutePath)
+            p.setOnVideoSizeChangedListener { _, w, h ->
+                vidW = w
+                vidH = h
+                fitVideo()
+            }
+            p.setOnPreparedListener { mp ->
+                if (myGen == gen) {
+                    if (prefs.getBoolean("mute", false)) mp.setVolume(0f, 0f)
+                    mp.start()
+                }
+            }
+            p.setOnCompletionListener { if (myGen == gen) next() }   // plays the FULL video, then the next file
+            p.setOnErrorListener { _, _, _ ->
+                if (myGen == gen) handler.postDelayed({ if (myGen == gen) next() }, 300)
+                true
+            }
+            p.prepareAsync()
+        } catch (e: Exception) {
+            handler.postDelayed({ if (myGen == gen) next() }, 500)
+        }
+    }
+
+    private fun releasePlayer() {
+        try { player?.stop() } catch (e: Exception) { }
+        try { player?.release() } catch (e: Exception) { }
+        player = null
+    }
+
+    private fun isVideoPlaying(): Boolean = try { player?.isPlaying ?: false } catch (e: Exception) { false }
+
+    // Fits the video inside the screen keeping its shape (works in landscape and portrait)
+    private fun fitVideo() {
+        if (vidW <= 0 || vidH <= 0 || lastPw <= 0 || lastPh <= 0) return
+        val scale = Math.min(lastPw.toFloat() / vidW, lastPh.toFloat() / vidH)
+        val lp = FrameLayout.LayoutParams(
+            Math.max(1, (vidW * scale).toInt()), Math.max(1, (vidH * scale).toInt()), Gravity.CENTER
+        )
+        tex.layoutParams = lp
+    }
+
     private fun showMessage(text: String) {
-        try { video.stopPlayback() } catch (e: Exception) { }
-        video.visibility = View.GONE
+        releasePlayer()
+        pendingFile = null
         image.visibility = View.GONE
         msg.text = text
         msg.visibility = View.VISIBLE
