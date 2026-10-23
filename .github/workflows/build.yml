@@ -1,5 +1,10 @@
 name: Build APK
-on: [push, workflow_dispatch]
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -14,3 +19,10 @@ jobs:
         with:
           name: SLauncher-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+      - name: Publish release (public download link)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk SLauncher.apk
+          gh release delete latest --cleanup-tag -y --repo ${{ github.repository }} || true
+          gh release create latest SLauncher.apk --title "Latest" --notes "Latest build" --target ${{ github.sha }} --repo ${{ github.repository }}
