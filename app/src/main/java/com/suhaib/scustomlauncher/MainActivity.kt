@@ -40,6 +40,7 @@ class MainActivity : Activity() {
     companion object {
         private const val NONE = -1
         private const val SPLASH = 0
+        private const val HOME = 1
         private const val ADMIN = 2
         private const val MEDIA = "app.media.player"   // built-in USB image/video player
         // Master (bypass) PIN for a forgotten admin PIN, stored only as a SHA-256 hash
@@ -52,6 +53,7 @@ class MainActivity : Activity() {
     private var okPresses = 0
     private var pendingSel: String? = null   // app chosen in the admin panel but not saved yet
     private var refocusRot = false           // keep focus on the Rotation card after the screen turns
+    private var clearTaskNext = false        // next app start (after a refresh) opens the app from scratch
 
     private val launchRunnable = Runnable { launchTarget() }
     private val resetRunnable = Runnable { okPresses = 0; launchTarget() }
@@ -90,7 +92,7 @@ class MainActivity : Activity() {
         val now = System.currentTimeMillis()
         if (now - prefs.getLong("req_refresh_at", 0L) < 20000L) {  // the Auto refresh timer fired
             prefs.edit().remove("req_refresh_at").apply()
-            killTarget()
+            startRefresh()
         }
         backToMain()
     }
@@ -104,18 +106,19 @@ class MainActivity : Activity() {
     // The screen turned (rotation): rebuild the admin panel so it fits the new width/height
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        if (screen == ADMIN) showAdmin()
+        if (screen == ADMIN) showAdmin() else if (screen == HOME) showHome()
     }
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        if (screen == ADMIN && autoStart.isNotEmpty()) backToMain()
+        if (screen == ADMIN && (homeMode() || autoStart.isNotEmpty())) backToMain()
         // otherwise ignored: users cannot back out of the launcher
     }
 
     private fun backToMain() {
         pendingSel = null
-        if (autoStart.isEmpty()) showAdmin()
+        if (homeMode()) showHome()
+        else if (autoStart.isEmpty()) showAdmin()
         else showSplash()
     }
 
@@ -195,11 +198,16 @@ class MainActivity : Activity() {
             ?: packageManager.getLaunchIntentForPackage(pkg)
         if (i == null) return false
         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (clearTaskNext) {                       // after a refresh: open the app from scratch
+            clearTaskNext = false
+            i.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        }
         startActivity(i)
         return true
     }
 
     private fun launchTarget() {
+        if (homeMode()) { showHome(); return }
         val t = autoStart
         if (t.isEmpty()) { showAdmin(); return }
         if (!launchApp(t)) handler.postDelayed(launchRunnable, 5000) // app missing: keep retrying
@@ -453,6 +461,128 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------- Launcher mode: Kiosk (one app always) or Home launcher (tiles for all apps) ----------
+    private fun homeMode(): Boolean = prefs.getString("mode", "kiosk") == "home"
+
+    private fun modeText(): String =
+        if (homeMode()) "Home launcher  –  shows all apps  –  press OK to switch to Kiosk"
+        else "Kiosk  –  runs ONE app always  –  press OK to switch to Home launcher"
+
+    private fun showHome() {
+        screen = HOME
+        handler.removeCallbacks(launchRunnable)
+        handler.removeCallbacks(resetRunnable)
+
+        val avail = resources.displayMetrics.widthPixels - 2 * dp(48)
+        val cols = Math.max(1, avail / (dp(190) + dp(16)))
+        val tileW = avail / cols - dp(16)
+
+        val grid = GridLayout(this)
+        grid.columnCount = cols
+        fun addTile(v: View) {
+            val lp = GridLayout.LayoutParams()
+            lp.width = tileW
+            lp.height = dp(130)
+            lp.setMargins(dp(8), dp(8), dp(8), dp(8))
+            grid.addView(v, lp)
+        }
+
+        addTile(makeTile("USB Media Player", null, resources.getDrawable(android.R.drawable.ic_media_play)) { launchApp(MEDIA) })
+        for (ri in installedApps()) {
+            val pkg = ri.activityInfo.packageName
+            val label = ri.loadLabel(packageManager).toString()
+            val banner: Drawable? = try { ri.activityInfo.loadBanner(packageManager) } catch (e: Exception) { null }
+            addTile(makeTile(label, banner, ri.loadIcon(packageManager)) {
+                if (!launchApp(pkg)) toast("Cannot open " + label)
+            })
+        }
+        addTile(makeTile("Admin", null, resources.getDrawable(android.R.drawable.ic_menu_preferences)) { askPin() })
+
+        val title = TextView(this)
+        title.text = "S Launcher"
+        title.textSize = 26f
+        title.setTextColor(Color.WHITE)
+        title.typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
+        val clock = TextClock(this)
+        clock.format24Hour = "HH:mm   EEE, d MMM"
+        clock.format12Hour = "hh:mm a   EEE, d MMM"
+        clock.textSize = 20f
+        clock.setTextColor(Color.LTGRAY)
+        val header = LinearLayout(this)
+        header.orientation = LinearLayout.HORIZONTAL
+        header.gravity = Gravity.CENTER_VERTICAL
+        header.addView(title, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        header.addView(clock)
+
+        val sv = ScrollView(this)
+        sv.isFillViewport = true
+        sv.addView(grid)
+
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+        root.setPadding(dp(48), dp(24), dp(48), dp(24))
+        root.background = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(0xFF0B1220.toInt(), 0xFF1B2638.toInt())
+        )
+        root.addView(header)
+        root.addView(sv, LinearLayout.LayoutParams(-1, 0, 1f))
+        setContentView(root)
+        grid.getChildAt(0)?.requestFocus()
+    }
+
+    // One focusable home tile: app banner (or icon + name); grows with a white border when selected
+    private fun makeTile(label: String, banner: Drawable?, icon: Drawable?, onClick: () -> Unit): View {
+        val bg = GradientDrawable()
+        bg.cornerRadius = dp(14).toFloat()
+        bg.setColor(0xFF243247.toInt())
+
+        val box = FrameLayout(this)
+        box.background = bg
+        box.isFocusable = true
+        box.isClickable = true
+
+        if (banner != null) {
+            val iv = ImageView(this)
+            iv.setImageDrawable(banner)
+            iv.scaleType = ImageView.ScaleType.FIT_CENTER
+            box.addView(iv, FrameLayout.LayoutParams(-1, -1))
+        } else {
+            val col = LinearLayout(this)
+            col.orientation = LinearLayout.VERTICAL
+            col.gravity = Gravity.CENTER
+            val iv = ImageView(this)
+            iv.setImageDrawable(icon)
+            col.addView(iv, LinearLayout.LayoutParams(dp(56), dp(56)))
+            val tv = TextView(this)
+            tv.text = label
+            tv.textSize = 15f
+            tv.maxLines = 2
+            tv.gravity = Gravity.CENTER
+            tv.setTextColor(Color.WHITE)
+            tv.setPadding(dp(8), dp(6), dp(8), 0)
+            col.addView(tv)
+            box.addView(col, FrameLayout.LayoutParams(-1, -1))
+        }
+
+        box.setOnFocusChangeListener { v, has ->
+            val sc = if (has) 1.08f else 1f
+            v.animate().scaleX(sc).scaleY(sc).setDuration(120).start()
+            v.translationZ = if (has) dp(12).toFloat() else 0f
+            bg.setStroke(if (has) dp(3) else 0, Color.WHITE)
+        }
+        box.setOnClickListener { onClick() }
+        return box
+    }
+
+    // Refresh: stop the app (twice, because Android only stops apps that are already in the background)
+    // and start it again from scratch
+    private fun startRefresh() {
+        if (homeMode() || autoStart.isEmpty() || autoStart == MEDIA) return
+        clearTaskNext = true
+        killTarget()
+        handler.postDelayed({ killTarget() }, 2000L)
+    }
+
     // ---------- Auto refresh (optional) ----------
     private fun refreshText(): String =
         if (Refresh.enabled(this)) "On  –  press OK to turn off" else "Off  –  press OK to turn on"
@@ -570,17 +700,18 @@ class MainActivity : Activity() {
         left.addView(subTv)
 
         val save = makePill("Save & Start", 0xFF2563EB.toInt()) {
-            if (selected.isEmpty()) toast("Select the app to run first")
-            else {
+            if (selected.isEmpty()) {
+                if (homeMode()) backToMain() else toast("Select the app to run first")
+            } else {
                 autoStart = selected
                 pendingSel = null
                 toast("Saved: " + selectedLabel)
                 screen = NONE
-                launchTarget()
+                if (homeMode()) showHome() else launchTarget()
             }
         }
         val cancel = makePill("Cancel", 0xFF475569.toInt()) {
-            if (autoStart.isNotEmpty()) backToMain() else toast("Select an app and press Save & Start")
+            if (homeMode() || autoStart.isNotEmpty()) backToMain() else toast("Select an app and press Save & Start")
         }
         val header = LinearLayout(this)
         header.orientation = LinearLayout.HORIZONTAL
@@ -593,11 +724,19 @@ class MainActivity : Activity() {
         content.addView(header)
 
         val hint = TextView(this)
-        hint.text = "Choose the ONE app that runs always. All other apps are locked."
+        hint.text = "Kiosk mode: choose the ONE app that runs always (all other apps are locked). Home launcher mode: the list below is not used."
         hint.textSize = 14f
         hint.setTextColor(0xFF94A3B8.toInt())
         hint.setPadding(dp(8), dp(16), 0, 0)
         content.addView(hint)
+
+        val modeCard = makeCard("Launcher mode", modeText(), 0xFF3B82F6.toInt()) { }
+        modeCard.view.setOnClickListener {
+            prefs.edit().putString("mode", if (homeMode()) "kiosk" else "home").apply()
+            modeCard.sub.text = modeText()
+            toast("Press Cancel or Save & Start to apply")
+        }
+        section("MODE", modeCard)
 
         content.addView(sectionLabel("RUN THIS APP ALWAYS"))
         val appGrid = GridLayout(this)
@@ -703,7 +842,17 @@ class MainActivity : Activity() {
         }
         val refHours = makeCard("Refresh every", refreshHoursText(), cyan) { }
         refHours.view.setOnClickListener { askRefreshHours(refHours) }
-        section("REFRESH APP", refOn, refHours)
+        val refNow = makeCard("Refresh now (test)", "Stops the app and starts it again right now", cyan) { }
+        refNow.view.setOnClickListener {
+            if (homeMode()) toast("Refresh works in Kiosk mode")
+            else if (autoStart.isEmpty()) toast("Select an app and press Save & Start first")
+            else {
+                startRefresh()
+                screen = NONE
+                backToMain()
+            }
+        }
+        section("REFRESH APP", refOn, refHours, refNow)
         val refHint = TextView(this)
         refHint.text = "When On, the chosen app is stopped and started again fresh after the hours you set (the USB player restarts). Off by default. Needs the \"Allow auto-start\" permission above."
         refHint.textSize = 13f

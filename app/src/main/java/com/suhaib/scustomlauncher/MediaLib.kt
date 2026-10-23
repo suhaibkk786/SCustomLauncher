@@ -12,6 +12,34 @@ object MediaLib {
 
     fun isVideo(f: File) = f.extension.lowercase() in VIDEOS
 
+    // Natural file-name order: 1.mp4, 2.jpg, 3.mp4 ... 10.jpg (not 1, 10, 2)
+    private val NATURAL = Comparator<File> { a, b -> naturalCompare(a.name.lowercase(), b.name.lowercase()) }
+
+    private fun naturalCompare(a: String, b: String): Int {
+        var i = 0
+        var j = 0
+        while (i < a.length && j < b.length) {
+            if (a[i].isDigit() && b[j].isDigit()) {
+                var si = i
+                while (si < a.length && a[si].isDigit()) si++
+                var sj = j
+                while (sj < b.length && b[sj].isDigit()) sj++
+                val na = a.substring(i, si).trimStart('0')
+                val nb = b.substring(j, sj).trimStart('0')
+                if (na.length != nb.length) return na.length - nb.length
+                val c = na.compareTo(nb)
+                if (c != 0) return c
+                i = si
+                j = sj
+            } else {
+                if (a[i] != b[j]) return a[i].compareTo(b[j])
+                i++
+                j++
+            }
+        }
+        return (a.length - i) - (b.length - j)
+    }
+
     private fun roots(ctx: Context): List<File> {
         val out = LinkedHashSet<File>()
         try {
@@ -42,7 +70,7 @@ object MediaLib {
             val dir = FOLDERS.map { File(root, it) }.firstOrNull { it.isDirectory } ?: root
             val files = ArrayList<File>()
             collect(dir, 0, files)
-            if (files.isNotEmpty()) return files.sortedBy { it.name.lowercase() } // 01_..., 02_... = order
+            if (files.isNotEmpty()) return files.sortedWith(NATURAL) // 1, 2, 3 ... 10, 11 (numbers in the name count as numbers)
         }
         return emptyList()
     }

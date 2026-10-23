@@ -35,6 +35,7 @@ class PlayerActivity : Activity() {
 
     private lateinit var root: FrameLayout
     private lateinit var tex: TextureView
+    private lateinit var cover: View          // opaque black layer: hides the old video frame between files
     private lateinit var image: ImageView
     private lateinit var msg: TextView
 
@@ -78,6 +79,10 @@ class PlayerActivity : Activity() {
             override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
         }
         root.addView(tex, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+
+        cover = View(this)
+        cover.setBackgroundColor(Color.BLACK)
+        root.addView(cover, FrameLayout.LayoutParams(-1, -1))
 
         // images and messages are drawn on an opaque black layer above the video
         image = ImageView(this)
@@ -223,6 +228,7 @@ class PlayerActivity : Activity() {
     }
 
     private fun showImage(f: File, myGen: Int) {
+        cover.visibility = View.VISIBLE   // the last video frame is hidden at once
         Thread {
             val bmp = decode(f)
             runOnUiThread {
@@ -246,6 +252,7 @@ class PlayerActivity : Activity() {
     }
 
     private fun playVideo(f: File, myGen: Int) {
+        cover.visibility = View.VISIBLE   // stays black until the new video shows its first picture
         image.visibility = View.GONE
         msg.visibility = View.GONE
         if (surface == null) {
@@ -278,7 +285,13 @@ class PlayerActivity : Activity() {
                 if (myGen == gen) {
                     if (prefs.getBoolean("mute", false)) mp.setVolume(0f, 0f)
                     mp.start()
+                    // safety: remove the black cover even if the "first picture" signal never comes
+                    handler.postDelayed({ if (myGen == gen) cover.visibility = View.GONE }, 800L)
                 }
+            }
+            p.setOnInfoListener { _, what, _ ->
+                if (what == MediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START && myGen == gen) cover.visibility = View.GONE
+                false
             }
             p.setOnCompletionListener { if (myGen == gen) next() }   // plays the FULL video, then the next file
             p.setOnErrorListener { _, _, _ ->
